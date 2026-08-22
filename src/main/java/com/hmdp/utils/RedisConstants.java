@@ -22,4 +22,7 @@ public class RedisConstants {
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";
     public static final String USER_SIGN_KEY = "sign:";
+
+    /** 全局唯一ID生成器的自增 key 前缀 */
+    public static final String ID_INCR_KEY = "incr:";
 }
