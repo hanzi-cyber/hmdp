@@ -74,13 +74,16 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     /**
      * 使用互斥锁解决缓存击穿：
      * 1. 缓存空值防穿透
-     * 2. 双重检查（Double Check）避免每个等待线程都查 DB
-     * 3. 锁使用 UUID 标记持有者，Lua 脚本原子释放防误删
+     * 2. 等待锁期间持续复查缓存：别的线程重建完成后立即返回，无需排队抢锁
+     *    （否则 N 个线程串行持锁各 ~10ms，队尾线程超时走降级会大量打 DB）
+     * 3. 拿到锁后 Double Check，锁用 UUID 标记持有者，Lua 脚本原子释放防误删
      * 4. 重试次数上限防死等
      */
     private Shop getShopByIdWithLock(Long id) {
+        String cacheKey = CACHE_SHOP_KEY + id;
+
         // 1. 查缓存（正常缓存 + 空值缓存 一起处理）
-        String shopJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
+        String shopJson = stringRedisTemplate.opsForValue().get(cacheKey);
         if (StrUtil.isNotBlank(shopJson)) {
             return JSONUtil.toBean(shopJson, Shop.class);
         }
@@ -92,26 +95,45 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         Shop shop = null;
         String lockKey = LOCK_SHOP_KEY + id;
         String lockValue = UUID.randomUUID().toString();  // 锁的唯一持有者标识
+        boolean locked = false;
         int retry = 0;
 
         try {
             // 2. 循环尝试获取锁，带重试次数上限
             while (retry < LOCK_MAX_RETRY) {
-                boolean isLocked = tryGetLock(lockKey, lockValue, LOCK_SHOP_TTL, TimeUnit.SECONDS);
-                if (isLocked) {
+                locked = tryGetLock(lockKey, lockValue, LOCK_SHOP_TTL, TimeUnit.SECONDS);
+                if (locked) {
                     break;
                 }
                 retry++;
                 Thread.sleep(LOCK_RETRY_INTERVAL);
+
+                // 关键：等待期间复查缓存。别的线程重建好后直接返回，
+                // 不要排队抢锁（排队会让线程串行化，队尾超时后会走降级打 DB）
+                String waitingJson = stringRedisTemplate.opsForValue().get(cacheKey);
+                if (StrUtil.isNotBlank(waitingJson)) {
+                    return JSONUtil.toBean(waitingJson, Shop.class);
+                }
+                if (waitingJson != null) {
+                    // 空值缓存已写入，DB 中不存在
+                    return null;
+                }
             }
-            if (retry >= LOCK_MAX_RETRY) {
-                // 多次重试拿不到锁：降级处理（直接打DB读一次，不写缓存，但至少能返回）
-                // 这里也可以改为返回"服务繁忙"，按业务选择
+
+            if (!locked) {
+                // 重试超时仍未拿到锁（极小概率）：先再查一次缓存，仍然没有才兜底打 DB
+                String lastJson = stringRedisTemplate.opsForValue().get(cacheKey);
+                if (StrUtil.isNotBlank(lastJson)) {
+                    return JSONUtil.toBean(lastJson, Shop.class);
+                }
+                if (lastJson != null) {
+                    return null;
+                }
                 return getById(id);
             }
 
             // 3. 拿到锁后，Double Check：再查一次缓存，可能前面的线程已经把缓存重建好了
-            String doubleCheckJson = stringRedisTemplate.opsForValue().get(CACHE_SHOP_KEY + id);
+            String doubleCheckJson = stringRedisTemplate.opsForValue().get(cacheKey);
             if (StrUtil.isNotBlank(doubleCheckJson)) {
                 return JSONUtil.toBean(doubleCheckJson, Shop.class);
             }
@@ -126,20 +148,22 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
             // 5. DB 中也不存在：写空值缓存防穿透
             if (shop == null) {
-                stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, "",
+                stringRedisTemplate.opsForValue().set(cacheKey, "",
                         CACHE_NULL_TTL, TimeUnit.MINUTES);
                 return null;
             }
 
             // 6. 写入正常缓存，带 TTL
-            stringRedisTemplate.opsForValue().set(CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop),
+            stringRedisTemplate.opsForValue().set(cacheKey, JSONUtil.toJsonStr(shop),
                     CACHE_SHOP_TTL, TimeUnit.MINUTES);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("查询商铺信息被中断", e);
         } finally {
-            // 7. 原子释放锁：只有自己的锁才能删
-            releaseLock(lockKey, lockValue);
+            // 7. 原子释放锁：只有真正拿到过锁才释放，且只有自己的锁才能删
+            if (locked) {
+                releaseLock(lockKey, lockValue);
+            }
         }
 
         return shop;
