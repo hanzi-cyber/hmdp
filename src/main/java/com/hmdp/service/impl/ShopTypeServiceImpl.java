@@ -55,6 +55,8 @@ public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> i
         }
 
         // 5. 写回 Redis：每个 ShopType 序列化为 JSON 后 push 到 list
+        //    先 DEL 确保是覆盖写入，而不是追加，防止并发下数据重复
+        stringRedisTemplate.delete(CACHE_SHOP_TYPE_KEY);
         List<String> jsonList = typeList.stream()
                 .map(JSONUtil::toJsonStr)
                 .collect(Collectors.toList());
