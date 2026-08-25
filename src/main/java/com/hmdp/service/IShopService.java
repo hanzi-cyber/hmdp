@@ -26,4 +26,6 @@ public interface IShopService extends IService<Shop> {
      * @param shopId 店铺id
      */
     void evictShopCacheAfterCommit(Long shopId);
+
+    Result queryShopByType(Integer typeId, Integer current, Double x, Double y);
 }
